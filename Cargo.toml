@@ -91,6 +91,7 @@ members = [
 	"node/runtime",
 	"node/rpc-client",
 	"node-template",
+	"hardchain",
 	"subkey",
 	"test-utils/chain-spec-builder",
 ]
