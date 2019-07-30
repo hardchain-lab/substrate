@@ -21,8 +21,8 @@ RUN mkdir /substrate/data
 RUN mkdir /substrate/bin
 
 # add substrate binary to docker image
-COPY ./hardchain /usr/local/bin
-COPY ./startup.sh /substrate/bin/startup.sh
+COPY ./hardchain /usr/local/bin/
+COPY ./startup.sh /substrate/bin/
 
 
 USER substrate
