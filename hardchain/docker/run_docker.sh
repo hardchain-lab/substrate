@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-docker run -v /home/junius/data/substrate:/substrate/data/ \
--v /home/junius/data/bin:/substrate/bin hardchain
+docker run -d -p 9944:9944 -p 9933:9933 -p 30333:30333 -v /data/substrate:/substrate/data/ \
+-v /data/bin:/substrate/bin hardchain
 
 
 
