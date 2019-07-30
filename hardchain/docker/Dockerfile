@@ -1,4 +1,4 @@
-FROM debian:stretch-slim
+FROM ubuntu:18.04
 
 # show backtraces
 ENV RUST_BACKTRACE 1
@@ -17,16 +17,21 @@ RUN apt-get update && \
 # add user
 	useradd -m -u 1000 -U -s /bin/sh -d /substrate substrate
 
+RUN mkdir /substrate/data
+RUN mkdir /substrate/bin
+
 # add substrate binary to docker image
-COPY ./substrate /usr/local/bin
+COPY ./hardchain /usr/local/bin
+COPY ./startup.sh /substrate/bin/startup.sh
+
 
 USER substrate
 
 # check if executable works in this container
-RUN /usr/local/bin/substrate --version
+RUN /usr/local/bin/hardchain --version
 
 EXPOSE 30333 9933 9944
 VOLUME ["/substrate"]
 
-ENTRYPOINT ["/usr/local/bin/substrate"]
+ENTRYPOINT ["/substrate/bin/startup.sh"]
 

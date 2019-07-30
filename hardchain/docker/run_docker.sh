@@ -1,2 +1,6 @@
 #!/usr/bin/env bash
-docker run -v /home/junius/data/mysql/conf:/etc/mysql/conf.d
+docker run -v /home/junius/data/substrate:/substrate/data/ \
+-v /home/junius/data/bin:/substrate/bin hardchain
+
+
+
