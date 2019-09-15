@@ -151,9 +151,9 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use parity_codec::{Decode, Encode, HasCompact, Input, Output};
+use codec::{Decode, Encode, HasCompact, Input, Output, Error};
 
-use primitives::traits::{
+use sr_primitives::traits::{
 	CheckedAdd, CheckedSub, MaybeSerializeDebug, Member, One, Saturating, SimpleArithmetic, Zero, Bounded
 };
 
@@ -256,11 +256,11 @@ pub enum PermissionVersions<AccountId> {
 
 /// Asset permission types
 pub enum PermissionType {
-	/// Permission to update asset permission
+	/// Permission to burn asset permission
 	Burn,
 	/// Permission to mint new asset
 	Mint,
-	/// Permission to burn asset
+	/// Permission to update asset
 	Update,
 }
 
@@ -284,10 +284,12 @@ impl<AccountId: Encode> Encode for PermissionVersions<AccountId> {
 	}
 }
 
+impl<AccountId: Encode> codec::EncodeLike for PermissionVersions<AccountId> {}
+
 impl<AccountId: Decode> Decode for PermissionVersions<AccountId> {
-	fn decode<I: Input>(input: &mut I) -> Option<Self> {
+	fn decode<I: Input>(input: &mut I) -> core::result::Result<Self, Error> {
 		let version = PermissionVersionNumber::decode(input)?;
-		Some(
+		Ok(
 			match version {
 				PermissionVersionNumber::V1 => PermissionVersions::V1(Decode::decode(input)?)
 			}
@@ -322,7 +324,7 @@ impl<AccountId> Into<PermissionVersions<AccountId>> for PermissionLatest<Account
 
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-		fn deposit_event<T>() = default;
+		fn deposit_event() = default;
 
 		/// Create a new kind of asset.
 		fn create(origin, options: AssetOptions<T::Balance, T::AccountId>) -> Result {
@@ -336,7 +338,7 @@ decl_module! {
 
 			<NextAssetId<T>>::put(next_id);
 			<TotalIssuance<T>>::insert(id, &options.initial_issuance);
-			<FreeBalance<T>>::insert(&id, &origin, options.initial_issuance);
+			<FreeBalance<T>>::insert(&id, &origin, &options.initial_issuance);
 			<Permissions<T>>::insert(&id, permissions);
 
 			Self::deposit_event(RawEvent::Created(id, origin, options));
@@ -476,16 +478,10 @@ decl_storage! {
 		config(initial_balance): T::Balance;
 		config(endowed_accounts): Vec<T::AccountId>;
 
-		build(|
-			storage: &mut primitives::StorageOverlay,
-			_: &mut primitives::ChildrenStorageOverlay,
-			config: &GenesisConfig<T>| {
+		build(|config: &GenesisConfig<T>| {
 			config.assets.iter().for_each(|asset_id| {
 				config.endowed_accounts.iter().for_each(|account_id| {
-					storage.insert(
-						<FreeBalance<T>>::key_for(asset_id, account_id),
-						<T::Balance as parity_codec::Encode>::encode(&config.initial_balance)
-					);
+					<FreeBalance<T>>::insert(asset_id, account_id, &config.initial_balance);
 				});
 			});
 		});
@@ -560,7 +556,7 @@ impl<T: Trait> Module<T> {
 		let permissions: PermissionVersions<T::AccountId> = options.permissions.clone().into();
 
 		<TotalIssuance<T>>::insert(asset_id, &options.initial_issuance);
-		<FreeBalance<T>>::insert(&asset_id, &account_id, options.initial_issuance);
+		<FreeBalance<T>>::insert(&asset_id, &account_id, &options.initial_issuance);
 		<Permissions<T>>::insert(&asset_id, permissions);
 
 		Self::deposit_event(RawEvent::Created(asset_id, account_id, options));
@@ -768,13 +764,13 @@ impl<T: Trait> Module<T> {
 	/// NOTE: LOW-LEVEL: This will not attempt to maintain total issuance. It is expected that
 	/// the caller will do this.
 	fn set_reserved_balance(asset_id: &T::AssetId, who: &T::AccountId, balance: T::Balance) {
-		<ReservedBalance<T>>::insert(asset_id, who, balance);
+		<ReservedBalance<T>>::insert(asset_id, who, &balance);
 	}
 
 	/// NOTE: LOW-LEVEL: This will not attempt to maintain total issuance. It is expected that
 	/// the caller will do this.
 	fn set_free_balance(asset_id: &T::AssetId, who: &T::AccountId, balance: T::Balance) {
-		<FreeBalance<T>>::insert(asset_id, who, balance);
+		<FreeBalance<T>>::insert(asset_id, who, &balance);
 	}
 
 	fn set_lock(
@@ -1048,6 +1044,7 @@ impl<T: Subtrait> PartialEq for ElevatedTrait<T> {
 impl<T: Subtrait> Eq for ElevatedTrait<T> {}
 impl<T: Subtrait> system::Trait for ElevatedTrait<T> {
 	type Origin = T::Origin;
+	type Call = T::Call;
 	type Index = T::Index;
 	type BlockNumber = T::BlockNumber;
 	type Hash = T::Hash;
@@ -1056,7 +1053,12 @@ impl<T: Subtrait> system::Trait for ElevatedTrait<T> {
 	type Lookup = T::Lookup;
 	type Header = T::Header;
 	type Event = ();
+	type MaximumBlockWeight = T::MaximumBlockWeight;
+	type MaximumBlockLength = T::MaximumBlockLength;
+	type AvailableBlockRatio = T::AvailableBlockRatio;
+	type WeightMultiplierUpdate = ();
 	type BlockHashCount = T::BlockHashCount;
+	type Version = T::Version;
 }
 impl<T: Subtrait> Trait for ElevatedTrait<T> {
 	type Balance = T::Balance;

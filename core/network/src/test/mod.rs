@@ -27,10 +27,13 @@ use std::sync::Arc;
 use crate::config::build_multiaddr;
 use log::trace;
 use crate::chain::FinalityProofProvider;
-use client::{self, ClientInfo, BlockchainEvents, BlockImportNotification, FinalityNotifications, FinalityNotification};
-use client::{in_mem::Backend as InMemoryBackend, error::Result as ClientResult};
+use client::{
+	self, ClientInfo, BlockchainEvents, BlockImportNotification, FinalityNotifications,
+	FinalityNotification, LongestChain
+};
+use client::error::Result as ClientResult;
 use client::block_builder::BlockBuilder;
-use client::backend::AuxStore;
+use client::backend::{AuxStore, Backend, Finalizer};
 use crate::config::Roles;
 use consensus::import_queue::BasicQueue;
 use consensus::import_queue::{
@@ -38,49 +41,50 @@ use consensus::import_queue::{
 };
 use consensus::block_import::{BlockImport, ImportResult};
 use consensus::{Error as ConsensusError, well_known_cache_keys::{self, Id as CacheKeyId}};
-use consensus::{BlockOrigin, ForkChoiceStrategy, ImportBlock, JustificationImport};
+use consensus::{BlockOrigin, ForkChoiceStrategy, BlockImportParams, JustificationImport};
 use futures::prelude::*;
 use futures03::{StreamExt as _, TryStreamExt as _};
 use crate::{NetworkWorker, NetworkService, config::ProtocolId};
 use crate::config::{NetworkConfiguration, TransportConfig, BoxFinalityProofRequestBuilder};
 use libp2p::PeerId;
 use parking_lot::Mutex;
-use primitives::{H256, Blake2Hasher};
+use primitives::H256;
 use crate::protocol::{Context, ProtocolConfig};
-use runtime_primitives::generic::{BlockId, OpaqueDigestItemId};
-use runtime_primitives::traits::{Block as BlockT, Header, NumberFor};
-use runtime_primitives::Justification;
+use sr_primitives::generic::{BlockId, OpaqueDigestItemId};
+use sr_primitives::traits::{Block as BlockT, Header, NumberFor};
+use sr_primitives::Justification;
 use crate::service::TransactionPool;
 use crate::specialization::NetworkSpecialization;
 use test_client::{self, AccountKeyring};
 
 pub use test_client::runtime::{Block, Extrinsic, Hash, Transfer};
-pub use test_client::TestClient;
+pub use test_client::{TestClient, TestClientBuilder, TestClientBuilderExt};
 
-type AuthorityId = primitives::sr25519::Public;
+type AuthorityId = babe_primitives::AuthorityId;
 
 #[cfg(any(test, feature = "test-helpers"))]
 /// A Verifier that accepts all blocks and passes them on with the configured
 /// finality to be imported.
+#[derive(Clone)]
 pub struct PassThroughVerifier(pub bool);
 
 #[cfg(any(test, feature = "test-helpers"))]
 /// This `Verifier` accepts all data as valid.
 impl<B: BlockT> Verifier<B> for PassThroughVerifier {
 	fn verify(
-		&self,
+		&mut self,
 		origin: BlockOrigin,
 		header: B::Header,
 		justification: Option<Justification>,
 		body: Option<Vec<B::Extrinsic>>
-	) -> Result<(ImportBlock<B>, Option<Vec<(CacheKeyId, Vec<u8>)>>), String> {
+	) -> Result<(BlockImportParams<B>, Option<Vec<(CacheKeyId, Vec<u8>)>>), String> {
 		let maybe_keys = header.digest()
 			.log(|l| l.try_as_raw(OpaqueDigestItemId::Consensus(b"aura"))
 				.or_else(|| l.try_as_raw(OpaqueDigestItemId::Consensus(b"babe")))
 			)
 			.map(|blob| vec![(well_known_cache_keys::AUTHORITIES, blob.to_vec())]);
 
-		Ok((ImportBlock {
+		Ok((BlockImportParams {
 			origin,
 			header,
 			body,
@@ -131,66 +135,57 @@ pub type PeersLightClient =
 
 #[derive(Clone)]
 pub enum PeersClient {
-	Full(Arc<PeersFullClient>),
-	Light(Arc<PeersLightClient>),
+	Full(Arc<PeersFullClient>, Arc<test_client::Backend>),
+	Light(Arc<PeersLightClient>, Arc<test_client::LightBackend>),
 }
 
 impl PeersClient {
 	pub fn as_full(&self) -> Option<Arc<PeersFullClient>> {
 		match *self {
-			PeersClient::Full(ref client) => Some(client.clone()),
+			PeersClient::Full(ref client, ref _backend) => Some(client.clone()),
 			_ => None,
 		}
 	}
 
 	pub fn as_block_import(&self) -> BoxBlockImport<Block> {
 		match *self {
-			PeersClient::Full(ref client) => Box::new(client.clone()) as _,
-			PeersClient::Light(ref client) => Box::new(client.clone()) as _,
-		}
-	}
-
-	pub fn as_in_memory_backend(&self) -> InMemoryBackend<Block, Blake2Hasher> {
-		#[allow(deprecated)]
-		match *self {
-			PeersClient::Full(ref client) => client.backend().as_in_memory(),
-			PeersClient::Light(_) => unimplemented!("TODO"),
+			PeersClient::Full(ref client, ref _backend) => Box::new(client.clone()) as _,
+			PeersClient::Light(ref client, ref _backend) => Box::new(client.clone()) as _,
 		}
 	}
 
 	pub fn get_aux(&self, key: &[u8]) -> ClientResult<Option<Vec<u8>>> {
-		#[allow(deprecated)]
 		match *self {
-			PeersClient::Full(ref client) => client.backend().get_aux(key),
-			PeersClient::Light(ref client) => client.backend().get_aux(key),
+			PeersClient::Full(ref client, ref _backend) => client.get_aux(key),
+			PeersClient::Light(ref client, ref _backend) => client.get_aux(key),
 		}
 	}
 
 	pub fn info(&self) -> ClientInfo<Block> {
 		match *self {
-			PeersClient::Full(ref client) => client.info(),
-			PeersClient::Light(ref client) => client.info(),
+			PeersClient::Full(ref client, ref _backend) => client.info(),
+			PeersClient::Light(ref client, ref _backend) => client.info(),
 		}
 	}
 
 	pub fn header(&self, block: &BlockId<Block>) -> ClientResult<Option<<Block as BlockT>::Header>> {
 		match *self {
-			PeersClient::Full(ref client) => client.header(block),
-			PeersClient::Light(ref client) => client.header(block),
+			PeersClient::Full(ref client, ref _backend) => client.header(block),
+			PeersClient::Light(ref client, ref _backend) => client.header(block),
 		}
 	}
 
 	pub fn justification(&self, block: &BlockId<Block>) -> ClientResult<Option<Justification>> {
 		match *self {
-			PeersClient::Full(ref client) => client.justification(block),
-			PeersClient::Light(ref client) => client.justification(block),
+			PeersClient::Full(ref client, ref _backend) => client.justification(block),
+			PeersClient::Light(ref client, ref _backend) => client.justification(block),
 		}
 	}
 
 	pub fn finality_notification_stream(&self) -> FinalityNotifications<Block> {
 		match *self {
-			PeersClient::Full(ref client) => client.finality_notification_stream(),
-			PeersClient::Light(ref client) => client.finality_notification_stream(),
+			PeersClient::Full(ref client, ref _backend) => client.finality_notification_stream(),
+			PeersClient::Light(ref client, ref _backend) => client.finality_notification_stream(),
 		}
 	}
 
@@ -201,8 +196,8 @@ impl PeersClient {
 		notify: bool
 	) -> ClientResult<()> {
 		match *self {
-			PeersClient::Full(ref client) => client.finalize_block(id, justification, notify),
-			PeersClient::Light(ref client) => client.finalize_block(id, justification, notify),
+			PeersClient::Full(ref client, ref _backend) => client.finalize_block(id, justification, notify),
+			PeersClient::Light(ref client, ref _backend) => client.finalize_block(id, justification, notify),
 		}
 	}
 }
@@ -212,10 +207,12 @@ pub struct Peer<D, S: NetworkSpecialization<Block>> {
 	client: PeersClient,
 	/// We keep a copy of the verifier so that we can invoke it for locally-generated blocks,
 	/// instead of going through the import queue.
-	verifier: Arc<dyn Verifier<Block>>,
+	verifier: VerifierAdapter<dyn Verifier<Block>>,
 	/// We keep a copy of the block_import so that we can invoke it for locally-generated blocks,
 	/// instead of going through the import queue.
 	block_import: Box<dyn BlockImport<Block, Error = ConsensusError>>,
+	select_chain: Option<LongestChain<test_client::Backend, Block>>,
+	backend: Option<Arc<test_client::Backend>>,
 	network: NetworkWorker<Block, S, <Block as BlockT>::Hash>,
 	imported_blocks_stream: Box<dyn Stream<Item = BlockImportNotification<Block>, Error = ()> + Send>,
 	finality_notification_stream: Box<dyn Stream<Item = FinalityNotification<Block>, Error = ()> + Send>,
@@ -225,6 +222,11 @@ impl<D, S: NetworkSpecialization<Block>> Peer<D, S> {
 	/// Returns true if we're major syncing.
 	pub fn is_major_syncing(&self) -> bool {
 		self.network.service().is_major_syncing()
+	}
+
+	// Returns a clone of the local SelectChain, only available on full nodes
+	pub fn select_chain(&self) -> Option<LongestChain<test_client::Backend, Block>> {
+		self.select_chain.clone()
 	}
 
 	/// Returns the number of peers we're connected to.
@@ -342,6 +344,33 @@ impl<D, S: NetworkSpecialization<Block>> Peer<D, S> {
 	pub fn network_service(&self) -> &Arc<NetworkService<Block, S, <Block as BlockT>::Hash>> {
 		&self.network.service()
 	}
+
+	/// Test helper to compare the blockchain state of multiple (networked)
+	/// clients.
+	/// Potentially costly, as it creates in-memory copies of both blockchains in order
+	/// to compare them. If you have easier/softer checks that are sufficient, e.g.
+	/// by using .info(), you should probably use it instead of this.
+	pub fn blockchain_canon_equals(&self, other: &Self) -> bool {
+		if let (Some(mine), Some(others)) = (self.backend.clone(), other.backend.clone()) {
+			mine.as_in_memory().blockchain()
+				.canon_equals_to(others.as_in_memory().blockchain())
+		} else {
+			false
+		}
+	}
+
+	/// Count the current number of known blocks. Note that:
+	///  1. this might be expensive as it creates an in-memory-copy of the chain
+	///     to count the blocks, thus if you have a different way of testing this
+	///     (e.g. `info.best_hash`) - use that.
+	///  2. This is not always increasing nor accurate, as the
+	///     orphaned and proven-to-never-finalized blocks may be pruned at any time.
+	///     Therefore, this number can drop again.
+	pub fn blocks_count(&self) -> usize {
+		self.backend.as_ref().map(
+			|backend| backend.as_in_memory().blockchain().blocks_count()
+		).unwrap_or(0)
+	}
 }
 
 pub struct EmptyTransactionPool;
@@ -388,10 +417,31 @@ impl<T: ?Sized + BlockImport<Block>> BlockImport<Block> for BlockImportAdapter<T
 
 	fn import_block(
 		&mut self,
-		block: ImportBlock<Block>,
+		block: BlockImportParams<Block>,
 		cache: HashMap<well_known_cache_keys::Id, Vec<u8>>,
 	) -> Result<ImportResult, Self::Error> {
 		self.0.lock().import_block(block, cache)
+	}
+}
+
+/// Implements `Verifier` on an `Arc<Mutex<impl Verifier>>`. Used internally.
+struct VerifierAdapter<T: ?Sized>(Arc<Mutex<Box<T>>>);
+
+impl<T: ?Sized> Clone for VerifierAdapter<T> {
+	fn clone(&self) -> Self {
+		VerifierAdapter(self.0.clone())
+	}
+}
+
+impl<B: BlockT, T: ?Sized + Verifier<B>> Verifier<B> for VerifierAdapter<T> {
+	fn verify(
+		&mut self,
+		origin: BlockOrigin,
+		header: B::Header,
+		justification: Option<Justification>,
+		body: Option<Vec<B::Extrinsic>>
+	) -> Result<(BlockImportParams<B>, Option<Vec<(CacheKeyId, Vec<u8>)>>), String> {
+		self.0.lock().verify(origin, header, justification, body)
 	}
 }
 
@@ -402,7 +452,7 @@ pub trait TestNetFactory: Sized {
 
 	/// These two need to be implemented!
 	fn from_config(config: &ProtocolConfig) -> Self;
-	fn make_verifier(&self, client: PeersClient, config: &ProtocolConfig) -> Arc<Self::Verifier>;
+	fn make_verifier(&self, client: PeersClient, config: &ProtocolConfig) -> Self::Verifier;
 
 	/// Get reference to peer.
 	fn peer(&mut self, i: usize) -> &mut Peer<Self::PeerData, Self::Specialization>;
@@ -446,10 +496,14 @@ pub trait TestNetFactory: Sized {
 
 	/// Add a full peer.
 	fn add_full_peer(&mut self, config: &ProtocolConfig) {
-		let client = Arc::new(test_client::new());
-		let verifier = self.make_verifier(PeersClient::Full(client.clone()), config);
+		let test_client_builder = TestClientBuilder::with_default_backend();
+		let backend = test_client_builder.backend();
+		let (c, longest_chain) = test_client_builder.build_with_longest_chain();
+		let client = Arc::new(c);
+		let verifier = self.make_verifier(PeersClient::Full(client.clone(), backend.clone()), config);
+		let verifier = VerifierAdapter(Arc::new(Mutex::new(Box::new(verifier) as Box<_>)));
 		let (block_import, justification_import, finality_proof_import, finality_proof_request_builder, data)
-			= self.make_block_import(PeersClient::Full(client.clone()));
+			= self.make_block_import(PeersClient::Full(client.clone(), backend.clone()));
 		let block_import = BlockImportAdapter(Arc::new(Mutex::new(block_import)));
 
 		let import_queue = Box::new(BasicQueue::new(
@@ -469,7 +523,7 @@ pub trait TestNetFactory: Sized {
 				..NetworkConfiguration::default()
 			},
 			chain: client.clone(),
-			finality_proof_provider: self.make_finality_proof_provider(PeersClient::Full(client.clone())),
+			finality_proof_provider: self.make_finality_proof_provider(PeersClient::Full(client.clone(), backend.clone())),
 			finality_proof_request_builder,
 			on_demand: None,
 			transaction_pool: Arc::new(EmptyTransactionPool),
@@ -490,7 +544,9 @@ pub trait TestNetFactory: Sized {
 
 			peers.push(Peer {
 				data,
-				client: PeersClient::Full(client),
+				client: PeersClient::Full(client, backend.clone()),
+				select_chain: Some(longest_chain),
+				backend: Some(backend),
 				imported_blocks_stream,
 				finality_notification_stream,
 				block_import: Box::new(block_import),
@@ -505,10 +561,12 @@ pub trait TestNetFactory: Sized {
 		let mut config = config.clone();
 		config.roles = Roles::LIGHT;
 
-		let client = Arc::new(test_client::new_light());
-		let verifier = self.make_verifier(PeersClient::Light(client.clone()), &config);
+		let (c, backend) = test_client::new_light();
+		let client = Arc::new(c);
+		let verifier = self.make_verifier(PeersClient::Light(client.clone(), backend.clone()), &config);
+		let verifier = VerifierAdapter(Arc::new(Mutex::new(Box::new(verifier) as Box<_>)));
 		let (block_import, justification_import, finality_proof_import, finality_proof_request_builder, data)
-			= self.make_block_import(PeersClient::Light(client.clone()));
+			= self.make_block_import(PeersClient::Light(client.clone(), backend.clone()));
 		let block_import = BlockImportAdapter(Arc::new(Mutex::new(block_import)));
 
 		let import_queue = Box::new(BasicQueue::new(
@@ -528,7 +586,7 @@ pub trait TestNetFactory: Sized {
 				..NetworkConfiguration::default()
 			},
 			chain: client.clone(),
-			finality_proof_provider: self.make_finality_proof_provider(PeersClient::Light(client.clone())),
+			finality_proof_provider: self.make_finality_proof_provider(PeersClient::Light(client.clone(), backend.clone())),
 			finality_proof_request_builder,
 			on_demand: None,
 			transaction_pool: Arc::new(EmptyTransactionPool),
@@ -550,8 +608,10 @@ pub trait TestNetFactory: Sized {
 			peers.push(Peer {
 				data,
 				verifier,
+				select_chain: None,
+				backend: None,
 				block_import: Box::new(block_import),
-				client: PeersClient::Light(client),
+				client: PeersClient::Light(client, backend),
 				imported_blocks_stream,
 				finality_notification_stream,
 				network,
@@ -568,6 +628,9 @@ pub trait TestNetFactory: Sized {
 		// Return `NotReady` if there's a mismatch in the highest block number.
 		let mut highest = None;
 		for peer in self.peers().iter() {
+			if peer.is_major_syncing() || peer.network.num_queued_blocks() != 0 {
+				return Async::NotReady
+			}
 			match (highest, peer.client.info().chain.best_number) {
 				(None, b) => highest = Some(b),
 				(Some(ref a), ref b) if a == b => {},
@@ -625,9 +688,9 @@ impl TestNetFactory for TestNet {
 	}
 
 	fn make_verifier(&self, _client: PeersClient, _config: &ProtocolConfig)
-		-> Arc<Self::Verifier>
+		-> Self::Verifier
 	{
-		Arc::new(PassThroughVerifier(false))
+		PassThroughVerifier(false)
 	}
 
 	fn peer(&mut self, i: usize) -> &mut Peer<(), Self::Specialization> {
@@ -670,9 +733,7 @@ impl TestNetFactory for JustificationTestNet {
 		JustificationTestNet(TestNet::from_config(config))
 	}
 
-	fn make_verifier(&self, client: PeersClient, config: &ProtocolConfig)
-		-> Arc<Self::Verifier>
-	{
+	fn make_verifier(&self, client: PeersClient, config: &ProtocolConfig) -> Self::Verifier {
 		self.0.make_verifier(client, config)
 	}
 

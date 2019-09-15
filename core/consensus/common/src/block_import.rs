@@ -16,8 +16,8 @@
 
 //! Block import helpers.
 
-use runtime_primitives::traits::{Block as BlockT, DigestItemFor, Header as HeaderT, NumberFor};
-use runtime_primitives::Justification;
+use sr_primitives::traits::{Block as BlockT, DigestItemFor, Header as HeaderT, NumberFor};
+use sr_primitives::Justification;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ pub enum ImportResult {
 }
 
 /// Auxiliary data associated with an imported block result.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct ImportedAux {
 	/// Clear all pending justification requests.
 	pub clear_justification_requests: bool,
@@ -49,24 +49,19 @@ pub struct ImportedAux {
 	pub bad_justification: bool,
 	/// Request a finality proof for the given block.
 	pub needs_finality_proof: bool,
-}
-
-impl Default for ImportedAux {
-	fn default() -> ImportedAux {
-		ImportedAux {
-			clear_justification_requests: false,
-			needs_justification: false,
-			bad_justification: false,
-			needs_finality_proof: false,
-		}
-	}
+	/// Whether the block that was imported is the new best block.
+	pub is_new_best: bool,
 }
 
 impl ImportResult {
-	/// Returns default value for `ImportResult::Imported` with both
-	/// `clear_justification_requests` and `needs_justification` set to false.
-	pub fn imported() -> ImportResult {
-		ImportResult::Imported(ImportedAux::default())
+	/// Returns default value for `ImportResult::Imported` with
+	/// `clear_justification_requests`, `needs_justification`,
+	/// `bad_justification` and `needs_finality_proof` set to false.
+	pub fn imported(is_new_best: bool) -> ImportResult {
+		let mut aux = ImportedAux::default();
+		aux.is_new_best = is_new_best;
+
+		ImportResult::Imported(aux)
 	}
 }
 
@@ -97,7 +92,7 @@ pub enum ForkChoiceStrategy {
 }
 
 /// Data required to import a Block
-pub struct ImportBlock<Block: BlockT> {
+pub struct BlockImportParams<Block: BlockT> {
 	/// Origin of the Block
 	pub origin: BlockOrigin,
 	/// The header, without consensus post-digests applied. This should be in the same
@@ -130,7 +125,7 @@ pub struct ImportBlock<Block: BlockT> {
 	pub fork_choice: ForkChoiceStrategy,
 }
 
-impl<Block: BlockT> ImportBlock<Block> {
+impl<Block: BlockT> BlockImportParams<Block> {
 	/// Deconstruct the justified header into parts.
 	pub fn into_inner(self)
 		-> (
@@ -186,7 +181,7 @@ pub trait BlockImport<B: BlockT> {
 	/// Cached data can be accessed through the blockchain cache.
 	fn import_block(
 		&mut self,
-		block: ImportBlock<B>,
+		block: BlockImportParams<B>,
 		cache: HashMap<well_known_cache_keys::Id, Vec<u8>>,
 	) -> Result<ImportResult, Self::Error>;
 }
@@ -206,7 +201,7 @@ where for<'r> &'r T: BlockImport<B, Error = E>
 
 	fn import_block(
 		&mut self,
-		block: ImportBlock<B>,
+		block: BlockImportParams<B>,
 		cache: HashMap<well_known_cache_keys::Id, Vec<u8>>,
 	) -> Result<ImportResult, Self::Error> {
 		(&**self).import_block(block, cache)
@@ -244,6 +239,6 @@ pub trait FinalityProofImport<B: BlockT> {
 		hash: B::Hash,
 		number: NumberFor<B>,
 		finality_proof: Vec<u8>,
-		verifier: &dyn Verifier<B>,
+		verifier: &mut dyn Verifier<B>,
 	) -> Result<(B::Hash, NumberFor<B>), Self::Error>;
 }

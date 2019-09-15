@@ -29,7 +29,7 @@ use futures::stream::Fuse;
 use futures03::{StreamExt as _, TryStreamExt as _};
 use grandpa::voter;
 use parking_lot::Mutex;
-use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, NumberFor};
+use sr_primitives::traits::{Block as BlockT, Header as HeaderT, NumberFor};
 use tokio_timer::Interval;
 
 use std::collections::{HashMap, VecDeque};
@@ -472,6 +472,7 @@ mod tests {
 				origin: BlockOrigin::File,
 				header,
 				is_new_best: false,
+				retracted: vec![],
 			}).unwrap();
 		}
 	}

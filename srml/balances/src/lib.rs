@@ -72,8 +72,6 @@
 //! - [`Imbalance`](../srml_support/traits/trait.Imbalance.html): Functions for handling
 //! imbalances between total issuance in the system and account balances. Must be used when a function
 //! creates new funds (e.g. a reward) or destroys some funds (e.g. a system fee).
-//! - [`MakePayment`](../srml_support/traits/trait.MakePayment.html): Simple trait designed
-//! for hooking into a transaction payment.
 //! - [`IsDeadAccount`](../srml_system/trait.IsDeadAccount.html): Determiner to say whether a
 //! given account is unused.
 //!
@@ -88,6 +86,17 @@
 //!
 //! - `vesting_balance` - Get the amount that is currently being vested and cannot be transferred out of this account.
 //!
+//! ### Signed Extensions
+//!
+//! The balances module defines the following extensions:
+//!
+//!   - [`TakeFees`]: Consumes fees proportional to the length and weight of the transaction.
+//!     Additionally, it can contain a single encoded payload as a `tip`. The inclusion priority
+//!     is increased proportional to the tip.
+//!
+//! Lookup the runtime aggregator file (e.g. `node/runtime`) to see the full list of signed
+//! extensions included in a chain.
+//!
 //! ## Usage
 //!
 //! The following examples show how to use the Balances module in your custom module.
@@ -97,7 +106,7 @@
 //! The Contract module uses the `Currency` trait to handle gas payment, and its types inherit from `Currency`:
 //!
 //! ```
-//! use srml_support::traits::Currency;
+//! use support::traits::Currency;
 //! # pub trait Trait: system::Trait {
 //! # 	type Currency: Currency<Self::AccountId>;
 //! # }
@@ -111,14 +120,14 @@
 //! The Staking module uses the `LockableCurrency` trait to lock a stash account's funds:
 //!
 //! ```
-//! use srml_support::traits::{WithdrawReasons, LockableCurrency};
-//! use primitives::traits::Bounded;
+//! use support::traits::{WithdrawReasons, LockableCurrency};
+//! use sr_primitives::traits::Bounded;
 //! pub trait Trait: system::Trait {
 //! 	type Currency: LockableCurrency<Self::AccountId, Moment=Self::BlockNumber>;
 //! }
 //! # struct StakingLedger<T: Trait> {
 //! # 	stash: <T as system::Trait>::AccountId,
-//! # 	total: <<T as Trait>::Currency as srml_support::traits::Currency<<T as system::Trait>::AccountId>>::Balance,
+//! # 	total: <<T as Trait>::Currency as support::traits::Currency<<T as system::Trait>::AccountId>>::Balance,
 //! # 	phantom: std::marker::PhantomData<T>,
 //! # }
 //! # const STAKING_ID: [u8; 8] = *b"staking ";
@@ -151,17 +160,26 @@
 
 use rstd::prelude::*;
 use rstd::{cmp, result, mem};
-use parity_codec::{Codec, Encode, Decode};
-use srml_support::{StorageValue, StorageMap, Parameter, decl_event, decl_storage, decl_module};
-use srml_support::traits::{
-	UpdateBalanceOutcome, Currency, OnFreeBalanceZero, MakePayment, OnUnbalanced,
-	WithdrawReason, WithdrawReasons, LockIdentifier, LockableCurrency, ExistenceRequirement,
-	Imbalance, SignedImbalance, ReservableCurrency
+use codec::{Codec, Encode, Decode};
+use support::{
+	StorageValue, StorageMap, Parameter, decl_event, decl_storage, decl_module,
+	traits::{
+		UpdateBalanceOutcome, Currency, OnFreeBalanceZero, OnUnbalanced,
+		WithdrawReason, WithdrawReasons, LockIdentifier, LockableCurrency, ExistenceRequirement,
+		Imbalance, SignedImbalance, ReservableCurrency, Get,
+	},
+	dispatch::Result,
 };
-use srml_support::{dispatch::Result, traits::Get};
-use primitives::traits::{
-	Zero, SimpleArithmetic, StaticLookup, Member, CheckedAdd, CheckedSub,
-	MaybeSerializeDebug, Saturating, Bounded
+use sr_primitives::{
+	transaction_validity::{
+		TransactionPriority, ValidTransaction, InvalidTransaction, TransactionValidityError,
+		TransactionValidity,
+	},
+	traits::{
+		Zero, SimpleArithmetic, StaticLookup, Member, CheckedAdd, CheckedSub, MaybeSerializeDebug,
+		Saturating, Bounded, SignedExtension, SaturatedConversion, Convert,
+	},
+	weights::{DispatchInfo, SimpleDispatchInfo, Weight},
 };
 use system::{IsDeadAccount, OnNewAccount, ensure_signed, ensure_root};
 
@@ -169,12 +187,6 @@ mod mock;
 mod tests;
 
 pub use self::imbalances::{PositiveImbalance, NegativeImbalance};
-
-pub const DEFAULT_EXISTENTIAL_DEPOSIT: u32 = 0;
-pub const DEFAULT_TRANSFER_FEE: u32 = 0;
-pub const DEFAULT_CREATION_FEE: u32 = 0;
-pub const DEFAULT_TRANSACTION_BASE_FEE: u32 = 0;
-pub const DEFAULT_TRANSACTION_BYTE_FEE: u32 = 0;
 
 pub trait Subtrait<I: Instance = DefaultInstance>: system::Trait {
 	/// The balance of an account.
@@ -204,6 +216,9 @@ pub trait Subtrait<I: Instance = DefaultInstance>: system::Trait {
 
 	/// The fee to be paid for making a transaction; the per-byte portion.
 	type TransactionByteFee: Get<Self::Balance>;
+
+	/// Convert a weight value into a deductible fee based on the currency type.
+	type WeightToFee: Convert<Weight, Self::Balance>;
 }
 
 pub trait Trait<I: Instance = DefaultInstance>: system::Trait {
@@ -247,6 +262,9 @@ pub trait Trait<I: Instance = DefaultInstance>: system::Trait {
 
 	/// The fee to be paid for making a transaction; the per-byte portion.
 	type TransactionByteFee: Get<Self::Balance>;
+
+	/// Convert a weight value into a deductible fee based on the currency type.
+	type WeightToFee: Convert<Weight, Self::Balance>;
 }
 
 impl<T: Trait<I>, I: Instance> Subtrait<I> for T {
@@ -258,6 +276,7 @@ impl<T: Trait<I>, I: Instance> Subtrait<I> for T {
 	type CreationFee = T::CreationFee;
 	type TransactionBaseFee = T::TransactionBaseFee;
 	type TransactionByteFee = T::TransactionByteFee;
+	type WeightToFee = T::WeightToFee;
 }
 
 decl_event!(
@@ -335,7 +354,7 @@ decl_storage! {
 						// Total genesis `balance` minus `liquid` equals funds locked for vesting
 						let locked = balance.saturating_sub(liquid);
 						// Number of units unlocked per block after `begin`
-						let per_block = locked / length.max(primitives::traits::One::one());
+						let per_block = locked / length.max(sr_primitives::traits::One::one());
 
 						(who.clone(), VestingSchedule {
 							locked: locked,
@@ -401,7 +420,7 @@ decl_module! {
 		/// The fee to be paid for making a transaction; the per-byte portion.
 		const TransactionByteFee: T::Balance = T::TransactionByteFee::get();
 
-		fn deposit_event<T, I>() = default;
+		fn deposit_event() = default;
 
 		/// Transfer some liquid free balance to another account.
 		///
@@ -426,6 +445,7 @@ decl_module! {
 		///     `T::DustRemoval::on_unbalanced` and `T::OnFreeBalanceZero::on_free_balance_zero`.
 		///
 		/// # </weight>
+		#[weight = SimpleDispatchInfo::FixedNormal(1_000_000)]
 		pub fn transfer(
 			origin,
 			dest: <T::Lookup as StaticLookup>::Source,
@@ -449,6 +469,7 @@ decl_module! {
 		/// - Independent of the arguments.
 		/// - Contains a limited number of reads and writes.
 		/// # </weight>
+		#[weight = SimpleDispatchInfo::FixedOperational(50_000)]
 		fn set_balance(
 			origin,
 			who: <T::Lookup as StaticLookup>::Source,
@@ -473,6 +494,21 @@ decl_module! {
 				mem::drop(NegativeImbalance::<T, I>::new(current_reserved - new_reserved));
 			}
 			Self::set_reserved_balance(&who, new_reserved);
+		}
+
+		/// Exactly as `transfer`, except the origin must be root and the source account may be
+		/// specified.
+		#[weight = SimpleDispatchInfo::FixedNormal(1_000_000)]
+		pub fn force_transfer(
+			origin,
+			source: <T::Lookup as StaticLookup>::Source,
+			dest: <T::Lookup as StaticLookup>::Source,
+			#[compact] value: T::Balance
+		) {
+			ensure_root(origin)?;
+			let source = T::Lookup::lookup(source)?;
+			let dest = T::Lookup::lookup(dest)?;
+			<Self as Currency<_>>::transfer(&source, &dest, value)?;
 		}
 	}
 }
@@ -752,6 +788,7 @@ impl<T: Subtrait<I>, I: Instance> PartialEq for ElevatedTrait<T, I> {
 impl<T: Subtrait<I>, I: Instance> Eq for ElevatedTrait<T, I> {}
 impl<T: Subtrait<I>, I: Instance> system::Trait for ElevatedTrait<T, I> {
 	type Origin = T::Origin;
+	type Call = T::Call;
 	type Index = T::Index;
 	type BlockNumber = T::BlockNumber;
 	type Hash = T::Hash;
@@ -759,8 +796,13 @@ impl<T: Subtrait<I>, I: Instance> system::Trait for ElevatedTrait<T, I> {
 	type AccountId = T::AccountId;
 	type Lookup = T::Lookup;
 	type Header = T::Header;
+	type WeightMultiplierUpdate = T::WeightMultiplierUpdate;
 	type Event = ();
 	type BlockHashCount = T::BlockHashCount;
+	type MaximumBlockWeight = T::MaximumBlockWeight;
+	type MaximumBlockLength = T::MaximumBlockLength;
+	type AvailableBlockRatio = T::AvailableBlockRatio;
+	type Version = T::Version;
 }
 impl<T: Subtrait<I>, I: Instance> Trait<I> for ElevatedTrait<T, I> {
 	type Balance = T::Balance;
@@ -775,6 +817,7 @@ impl<T: Subtrait<I>, I: Instance> Trait<I> for ElevatedTrait<T, I> {
 	type CreationFee = T::CreationFee;
 	type TransactionBaseFee = T::TransactionBaseFee;
 	type TransactionByteFee = T::TransactionByteFee;
+	type WeightToFee = T::WeightToFee;
 }
 
 impl<T: Trait<I>, I: Instance> Currency<T::AccountId> for Module<T, I>
@@ -806,12 +849,12 @@ where
 	}
 
 	fn burn(mut amount: Self::Balance) -> Self::PositiveImbalance {
-		<TotalIssuance<T, I>>::mutate(|issued|
-			issued.checked_sub(&amount).unwrap_or_else(|| {
+		<TotalIssuance<T, I>>::mutate(|issued| {
+			*issued = issued.checked_sub(&amount).unwrap_or_else(|| {
 				amount = *issued;
 				Zero::zero()
-			})
-		);
+			});
+		});
 		PositiveImbalance::new(amount)
 	}
 
@@ -1144,18 +1187,88 @@ where
 	}
 }
 
-impl<T: Trait<I>, I: Instance> MakePayment<T::AccountId> for Module<T, I> {
-	fn make_payment(transactor: &T::AccountId, encoded_len: usize) -> Result {
-		let encoded_len = T::Balance::from(encoded_len as u32);
-		let transaction_fee = T::TransactionBaseFee::get() + T::TransactionByteFee::get() * encoded_len;
-		let imbalance = Self::withdraw(
-			transactor,
-			transaction_fee,
+/// Require the transactor pay for themselves and maybe include a tip to gain additional priority
+/// in the queue.
+#[derive(Encode, Decode, Clone, Eq, PartialEq)]
+pub struct TakeFees<T: Trait<I>, I: Instance = DefaultInstance>(#[codec(compact)] T::Balance);
+
+impl<T: Trait<I>, I: Instance> TakeFees<T, I> {
+	/// utility constructor. Used only in client/factory code.
+	pub fn from(fee: T::Balance) -> Self {
+		Self(fee)
+	}
+
+	/// Compute the final fee value for a particular transaction.
+	///
+	/// The final fee is composed of:
+	///   - _length-fee_: This is the amount paid merely to pay for size of the transaction.
+	///   - _weight-fee_: This amount is computed based on the weight of the transaction. Unlike
+	///      size-fee, this is not input dependent and reflects the _complexity_ of the execution
+	///      and the time it consumes.
+	///   - (optional) _tip_: if included in the transaction, it will be added on top. Only signed
+	///      transactions can have a tip.
+	fn compute_fee(len: usize, info: DispatchInfo, tip: T::Balance) -> T::Balance {
+		let len_fee = if info.pay_length_fee() {
+			let len = T::Balance::from(len as u32);
+			let base = T::TransactionBaseFee::get();
+			let per_byte = T::TransactionByteFee::get();
+			base.saturating_add(per_byte.saturating_mul(len))
+		} else {
+			Zero::zero()
+		};
+
+		let weight_fee = {
+			// cap the weight to the maximum defined in runtime, otherwise it will be the `Bounded`
+			// maximum of its data type, which is not desired.
+			let capped_weight = info.weight.min(<T as system::Trait>::MaximumBlockWeight::get());
+			let weight_update = <system::Module<T>>::next_weight_multiplier();
+			let adjusted_weight = weight_update.apply_to(capped_weight);
+			T::WeightToFee::convert(adjusted_weight)
+		};
+
+		len_fee.saturating_add(weight_fee).saturating_add(tip)
+	}
+}
+
+#[cfg(feature = "std")]
+impl<T: Trait<I>, I: Instance> rstd::fmt::Debug for TakeFees<T, I> {
+	fn fmt(&self, f: &mut rstd::fmt::Formatter) -> rstd::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+impl<T: Trait<I>, I: Instance + Clone + Eq> SignedExtension for TakeFees<T, I> {
+	type AccountId = T::AccountId;
+	type Call = T::Call;
+	type AdditionalSigned = ();
+	type Pre = ();
+	fn additional_signed(&self) -> rstd::result::Result<(), TransactionValidityError> { Ok(()) }
+
+	fn validate(
+		&self,
+		who: &Self::AccountId,
+		_call: &Self::Call,
+		info: DispatchInfo,
+		len: usize,
+	) -> TransactionValidity {
+		// pay any fees.
+		let fee = Self::compute_fee(len, info, self.0);
+		let imbalance = match <Module<T, I>>::withdraw(
+			who,
+			fee,
 			WithdrawReason::TransactionPayment,
-			ExistenceRequirement::KeepAlive
-		)?;
+			ExistenceRequirement::KeepAlive,
+		) {
+			Ok(imbalance) => imbalance,
+			Err(_) => return InvalidTransaction::Payment.into(),
+		};
 		T::TransactionPayment::on_unbalanced(imbalance);
-		Ok(())
+
+		let mut r = ValidTransaction::default();
+		// NOTE: we probably want to maximize the _fee (of any type) per weight unit_ here, which
+		// will be a bit more than setting the priority to tip. For now, this is enough.
+		r.priority = fee.saturated_into::<TransactionPriority>();
+		Ok(r)
 	}
 }
 

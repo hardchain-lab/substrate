@@ -19,13 +19,14 @@
 #![cfg(test)]
 
 use super::*;
-use mock::{Balances, ExtBuilder, Runtime, System};
+use mock::{Balances, ExtBuilder, Runtime, System, info_from_weight, CALL};
 use runtime_io::with_externalities;
-use srml_support::{
+use support::{
 	assert_noop, assert_ok, assert_err,
 	traits::{LockableCurrency, LockIdentifier, WithdrawReason, WithdrawReasons,
-	Currency, MakePayment, ReservableCurrency}
+	Currency, ReservableCurrency}
 };
+use system::RawOrigin;
 
 const ID_1: LockIdentifier = *b"1       ";
 const ID_2: LockIdentifier = *b"2       ";
@@ -114,7 +115,7 @@ fn lock_reasons_should_work() {
 	with_externalities(
 		&mut ExtBuilder::default()
 			.existential_deposit(1)
-			.monied(true).transaction_fees(0, 1)
+			.monied(true).transaction_fees(0, 1, 0)
 			.build(),
 		|| {
 			Balances::set_lock(ID_1, &1, 10, u64::max_value(), WithdrawReason::Transfer.into());
@@ -123,7 +124,14 @@ fn lock_reasons_should_work() {
 				"account liquidity restrictions prevent withdrawal"
 			);
 			assert_ok!(<Balances as ReservableCurrency<_>>::reserve(&1, 1));
-			assert_ok!(<Balances as MakePayment<_>>::make_payment(&1, 1));
+			// NOTE: this causes a fee payment.
+			assert!(<TakeFees<Runtime> as SignedExtension>::pre_dispatch(
+				TakeFees::from(1),
+				&1,
+				CALL,
+				info_from_weight(1),
+				0,
+			).is_ok());
 
 			Balances::set_lock(ID_1, &1, 10, u64::max_value(), WithdrawReason::Reserve.into());
 			assert_ok!(<Balances as Currency<_>>::transfer(&1, &2, 1));
@@ -131,15 +139,24 @@ fn lock_reasons_should_work() {
 				<Balances as ReservableCurrency<_>>::reserve(&1, 1),
 				"account liquidity restrictions prevent withdrawal"
 			);
-			assert_ok!(<Balances as MakePayment<_>>::make_payment(&1, 1));
+			assert!(<TakeFees<Runtime> as SignedExtension>::pre_dispatch(
+				TakeFees::from(1),
+				&1,
+				CALL,
+				info_from_weight(1),
+				0,
+			).is_ok());
 
 			Balances::set_lock(ID_1, &1, 10, u64::max_value(), WithdrawReason::TransactionPayment.into());
 			assert_ok!(<Balances as Currency<_>>::transfer(&1, &2, 1));
 			assert_ok!(<Balances as ReservableCurrency<_>>::reserve(&1, 1));
-			assert_noop!(
-				<Balances as MakePayment<_>>::make_payment(&1, 1),
-				"account liquidity restrictions prevent withdrawal"
-			);
+			assert!(<TakeFees<Runtime> as SignedExtension>::pre_dispatch(
+				TakeFees::from(1),
+				&1,
+				CALL,
+				info_from_weight(1),
+				0,
+			).is_err());
 		}
 	);
 }
@@ -215,7 +232,7 @@ fn default_indexing_on_new_accounts_should_not_work2() {
 			// ext_deposit is 10, value is 9, not satisfies for ext_deposit
 			assert_noop!(
 				Balances::transfer(Some(1).into(), 5, 9),
-				"value too low to create account"
+				"value too low to create account",
 			);
 			assert_eq!(Balances::is_dead_account(&5), true); // account 5 should not exist
 			assert_eq!(Balances::free_balance(&1), 100);
@@ -337,6 +354,20 @@ fn balance_transfer_works() {
 }
 
 #[test]
+fn force_transfer_works() {
+	with_externalities(&mut ExtBuilder::default().build(), || {
+		let _ = Balances::deposit_creating(&1, 111);
+		assert_noop!(
+			Balances::force_transfer(Some(2).into(), 1, 2, 69),
+			"RequireRootOrigin",
+		);
+		assert_ok!(Balances::force_transfer(RawOrigin::Root.into(), 1, 2, 69));
+		assert_eq!(Balances::total_balance(&1), 42);
+		assert_eq!(Balances::total_balance(&2), 69);
+	});
+}
+
+#[test]
 fn reserving_balance_should_work() {
 	with_externalities(&mut ExtBuilder::default().build(), || {
 		let _ = Balances::deposit_creating(&1, 111);
@@ -358,7 +389,10 @@ fn balance_transfer_when_reserved_should_not_work() {
 	with_externalities(&mut ExtBuilder::default().build(), || {
 		let _ = Balances::deposit_creating(&1, 111);
 		assert_ok!(Balances::reserve(&1, 69));
-		assert_noop!(Balances::transfer(Some(1).into(), 2, 69), "balance too low to send value");
+		assert_noop!(
+			Balances::transfer(Some(1).into(), 2, 69),
+			"balance too low to send value",
+		);
 	});
 }
 
@@ -486,7 +520,7 @@ fn transferring_too_high_value_should_not_panic() {
 
 		assert_err!(
 			Balances::transfer(Some(1).into(), 2, u64::max_value()),
-			"destination balance too high to receive value"
+			"destination balance too high to receive value",
 		);
 
 		assert_eq!(Balances::free_balance(&1), u64::max_value());
@@ -564,7 +598,7 @@ fn transfer_overflow_isnt_exploitable() {
 
 			assert_err!(
 				Balances::transfer(Some(1).into(), 5, evil_value),
-				"got overflow after adding a fee to value"
+				"got overflow after adding a fee to value",
 			);
 		}
 	);
@@ -616,7 +650,7 @@ fn check_vesting_status() {
 			assert_eq!(System::block_number(), 10);
 
 			// Account 1 has fully vested by block 10
-			assert_eq!(Balances::vesting_balance(&1), 0); 
+			assert_eq!(Balances::vesting_balance(&1), 0);
 			// Account 2 has started vesting by block 10
 			assert_eq!(Balances::vesting_balance(&2), user2_free_balance);
 			// Account 12 has started vesting by block 10
@@ -649,7 +683,7 @@ fn unvested_balance_should_not_transfer() {
 			assert_eq!(Balances::vesting_balance(&1), 45);
 			assert_noop!(
 				Balances::transfer(Some(1).into(), 2, 56),
-				"vesting balance too high to send value"
+				"vesting balance too high to send value",
 			); // Account 1 cannot send more than vested amount
 		}
 	);
@@ -730,6 +764,62 @@ fn liquid_funds_should_transfer_with_delayed_vesting() {
 
 			// Account 12 can still send liquid funds
 			assert_ok!(Balances::transfer(Some(12).into(), 3, 256 * 5));
+		}
+	);
+}
+
+#[test]
+fn signed_extension_take_fees_work() {
+	with_externalities(
+		&mut ExtBuilder::default()
+			.existential_deposit(10)
+			.transaction_fees(10, 1, 5)
+			.monied(true)
+			.build(),
+		|| {
+			let len = 10;
+			assert!(TakeFees::<Runtime>::from(0).pre_dispatch(&1, CALL, info_from_weight(5), len).is_ok());
+			assert_eq!(Balances::free_balance(&1), 100 - 20 - 25);
+			assert!(TakeFees::<Runtime>::from(5 /* tipped */).pre_dispatch(&1, CALL, info_from_weight(3), len).is_ok());
+			assert_eq!(Balances::free_balance(&1), 100 - 20 - 25 - 20 - 5 - 15);
+		}
+	);
+}
+
+#[test]
+fn signed_extension_take_fees_is_bounded() {
+	with_externalities(
+		&mut ExtBuilder::default()
+			.existential_deposit(1000)
+			.transaction_fees(0, 0, 1)
+			.monied(true)
+			.build(),
+		|| {
+			use sr_primitives::weights::Weight;
+
+			// maximum weight possible
+			assert!(TakeFees::<Runtime>::from(0).pre_dispatch(&1, CALL, info_from_weight(Weight::max_value()), 10).is_ok());
+			// fee will be proportional to what is the actual maximum weight in the runtime.
+			assert_eq!(
+				Balances::free_balance(&1),
+				(10000 - <Runtime as system::Trait>::MaximumBlockWeight::get()) as u64
+			);
+		}
+	);
+}
+
+#[test]
+fn burn_must_work() {
+	with_externalities(
+		&mut ExtBuilder::default()
+			.monied(true)
+			.build(),
+		|| {
+			let init_total_issuance = Balances::total_issuance();
+			let imbalance = Balances::burn(10);
+			assert_eq!(Balances::total_issuance(), init_total_issuance - 10);
+			drop(imbalance);
+			assert_eq!(Balances::total_issuance(), init_total_issuance);
 		}
 	);
 }

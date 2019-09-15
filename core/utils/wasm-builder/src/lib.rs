@@ -66,6 +66,8 @@
 //!                          needs to change. As WASM builder instructs `cargo` to watch for file changes
 //!                          this environment variable should only be required in certain circumstances.
 //! - `WASM_BUILD_RUSTFLAGS` - Extend `RUSTFLAGS` given to `cargo build` while building the WASM binary.
+//! - `WASM_TARGET_DIRECTORY` - Will copy any build WASM binary to the given directory. The path needs
+//!                            to be absolute.
 //!
 //! Each project can be skipped individually by using the environment variable `SKIP_PROJECT_NAME_WASM_BUILD`.
 //! Where `PROJECT_NAME` needs to be replaced by the name of the cargo project, e.g. `node-runtime` will
@@ -96,6 +98,11 @@ const WASM_BUILD_TYPE_ENV: &str = "WASM_BUILD_TYPE";
 /// Environment variable to extend the `RUSTFLAGS` variable given to the WASM build.
 const WASM_BUILD_RUSTFLAGS_ENV: &str = "WASM_BUILD_RUSTFLAGS";
 
+/// Environment variable to set the target directory to copy the final WASM binary.
+///
+/// The directory needs to be an absolute path.
+const WASM_TARGET_DIRECTORY: &str = "WASM_TARGET_DIRECTORY";
+
 /// Build the currently built project as WASM binary.
 ///
 /// The current project is determined by using the `CARGO_MANIFEST_DIR` environment variable.
@@ -104,6 +111,22 @@ const WASM_BUILD_RUSTFLAGS_ENV: &str = "WASM_BUILD_RUSTFLAGS";
 ///               constant `WASM_BINARY`, which contains the built WASM binary.
 /// `cargo_manifest` - The path to the `Cargo.toml` of the project that should be built.
 pub fn build_project(file_name: &str, cargo_manifest: &str) {
+	build_project_with_default_rustflags(file_name, cargo_manifest, "");
+}
+
+/// Build the currently built project as WASM binary.
+///
+/// The current project is determined by using the `CARGO_MANIFEST_DIR` environment variable.
+///
+/// `file_name` - The name + path of the file being generated. The file contains the
+///               constant `WASM_BINARY`, which contains the built WASM binary.
+/// `cargo_manifest` - The path to the `Cargo.toml` of the project that should be built.
+/// `default_rustflags` - Default `RUSTFLAGS` that will always be set for the build.
+pub fn build_project_with_default_rustflags(
+	file_name: &str,
+	cargo_manifest: &str,
+	default_rustflags: &str,
+) {
 	if check_skip_build() {
 		return;
 	}
@@ -123,10 +146,13 @@ pub fn build_project(file_name: &str, cargo_manifest: &str) {
 		process::exit(1);
 	}
 
-	let (wasm_binary, bloaty) = wasm_project::create_and_compile(&cargo_manifest);
+	let (wasm_binary, bloaty) = wasm_project::create_and_compile(
+		&cargo_manifest,
+		default_rustflags,
+	);
 
-	create_out_file(
-		file_name,
+	write_file_if_changed(
+		file_name.into(),
 		format!(
 			r#"
 				pub const WASM_BINARY: &[u8] = include_bytes!("{wasm_binary}");
@@ -143,26 +169,74 @@ fn check_skip_build() -> bool {
 	env::var(SKIP_BUILD_ENV).is_ok()
 }
 
-fn create_out_file(file_name: &str, content: String) {
-	fs::write(
-		file_name,
-		content
-	).expect("Creating and writing can not fail; qed");
+/// Write to the given `file` if the `content` is different.
+fn write_file_if_changed(file: PathBuf, content: String) {
+	if fs::read_to_string(&file).ok().as_ref() != Some(&content) {
+		fs::write(&file, content).expect(&format!("Writing `{}` can not fail!", file.display()));
+	}
 }
 
 /// Get a cargo command that compiles with nightly
-fn get_nightly_cargo() -> Command {
-	if Command::new("rustup")
-		.args(&["run", "nightly", "cargo"])
-		.stdout(Stdio::null())
-		.stderr(Stdio::null())
-		.status()
-		.map(|s| s.success()).unwrap_or(false)
-	{
-		let mut cmd = Command::new("rustup");
-		cmd.args(&["run", "nightly", "cargo"]);
-		cmd
+fn get_nightly_cargo() -> CargoCommand {
+	let default_cargo = CargoCommand::new("cargo");
+	let mut rustup_run_nightly = CargoCommand::new("rustup");
+	rustup_run_nightly.args(&["run", "nightly", "cargo"]);
+
+	if default_cargo.is_nightly() {
+		default_cargo
+	} else if rustup_run_nightly.works() {
+		rustup_run_nightly
 	} else {
-		Command::new("cargo")
+		default_cargo
+	}
+}
+
+/// Builder for cargo commands
+#[derive(Debug)]
+struct CargoCommand {
+	program: String,
+	args: Vec<String>,
+}
+
+impl CargoCommand {
+	fn new(program: &str) -> Self {
+		CargoCommand { program: program.into(), args: Vec::new() }
+	}
+
+	fn arg(&mut self, arg: &str) -> &mut Self {
+		self.args.push(arg.into());
+		self
+	}
+
+	fn args(&mut self, args: &[&str]) -> &mut Self {
+		for arg in args {
+			self.arg(arg);
+		}
+		self
+	}
+
+	fn command(&self) -> Command {
+		let mut cmd = Command::new(&self.program);
+		cmd.args(&self.args);
+		cmd
+	}
+
+	fn works(&self) -> bool {
+		self.command()
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status()
+			.map(|s| s.success()).unwrap_or(false)
+	}
+
+	/// Check if the supplied cargo command is a nightly version
+	fn is_nightly(&self) -> bool {
+		self.command()
+			.arg("--version")
+			.output()
+			.map_err(|_| ())
+			.and_then(|o| String::from_utf8(o.stdout).map_err(|_| ()))
+			.unwrap_or_default()
+			.contains("-nightly")
 	}
 }

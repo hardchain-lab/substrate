@@ -172,7 +172,7 @@
 
 mod behaviour;
 mod chain;
-mod custom_proto;
+mod legacy_proto;
 mod debug_info;
 mod discovery;
 mod on_demand_layer;
@@ -189,8 +189,10 @@ pub mod test;
 pub use chain::{Client as ClientHandle, FinalityProofProvider};
 pub use service::{
 	NetworkService, NetworkWorker, TransactionPool, ExHashT, ReportHandle,
+	NetworkStateInfo,
 };
 pub use protocol::{PeerInfo, Context, consensus_gossip, message, specialization};
+pub use protocol::event::{Event, DhtEvent};
 pub use protocol::sync::SyncState;
 pub use libp2p::{Multiaddr, PeerId};
 #[doc(inline)]
@@ -201,9 +203,9 @@ pub use on_demand_layer::{OnDemand, RemoteResponse};
 
 // Used by the `construct_simple_protocol!` macro.
 #[doc(hidden)]
-pub use runtime_primitives::traits::Block as BlockT;
+pub use sr_primitives::traits::Block as BlockT;
 
-use libp2p::core::nodes::ConnectedPoint;
+use libp2p::core::ConnectedPoint;
 use serde::{Deserialize, Serialize};
 use slog_derive::SerdeValue;
 use std::{collections::{HashMap, HashSet}, time::Duration};
@@ -285,8 +287,8 @@ pub enum NetworkStatePeerEndpoint {
 	Dialing(Multiaddr),
 	/// We are listening.
 	Listening {
-		/// Address we're listening on that received the connection.
-		listen_addr: Multiaddr,
+		/// Local address of the connection.
+		local_addr: Multiaddr,
 		/// Address data is sent back to.
 		send_back_addr: Multiaddr,
 	},
@@ -297,9 +299,9 @@ impl From<ConnectedPoint> for NetworkStatePeerEndpoint {
 		match endpoint {
 			ConnectedPoint::Dialer { address } =>
 				NetworkStatePeerEndpoint::Dialing(address),
-			ConnectedPoint::Listener { listen_addr, send_back_addr } =>
+			ConnectedPoint::Listener { local_addr, send_back_addr } =>
 				NetworkStatePeerEndpoint::Listening {
-					listen_addr,
+					local_addr,
 					send_back_addr
 				}
 		}
